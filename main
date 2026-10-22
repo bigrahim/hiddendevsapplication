@@ -1,0 +1,281 @@
+local plrs = game:GetService("Players")
+local ss = game:GetService("ServerStorage")
+local rs = game:GetService("RunService")
+
+local arena = workspace:WaitForChild("arena")
+local floor = arena:WaitForChild("floor")
+local ctmp = ss:WaitForChild("coin")
+local htmp = ss:WaitForChild("hazard")
+
+local goal = 15
+local maxc = 12
+local nhaz = 4
+local rlen = 60
+local lobby = 5
+local rare = 0.15
+local rng = Random.new()
+
+local on = false
+local champ = nil
+local left = 0
+local coins = {}
+local hazs = {}
+local guis = {}
+
+local function randpos(h)
+	local s = floor.Size
+	local x = rng:NextNumber(-s.X / 2 + 4, s.X / 2 - 4)
+	local z = rng:NextNumber(-s.Z / 2 + 4, s.Z / 2 - 4)
+	return floor.Position + Vector3.new(x, s.Y / 2 + h, z)
+end
+
+local function mklabel(parent, name, y, size)
+	local l = Instance.new("TextLabel")
+	l.Name = name
+	l.Size = UDim2.new(1, 0, 0, size)
+	l.Position = UDim2.new(0, 0, 0, y)
+	l.BackgroundTransparency = 1
+	l.TextColor3 = Color3.new(1, 1, 1)
+	l.TextStrokeTransparency = 0
+	l.TextSize = size
+	l.Font = Enum.Font.GothamBold
+	l.Text = ""
+	l.Parent = parent
+	return l
+end
+
+local function mkgui(p)
+	local g = Instance.new("ScreenGui")
+	g.Name = "hud"
+	g.ResetOnSpawn = false
+	mklabel(g, "msg", 10, 36)
+	mklabel(g, "time", 50, 28)
+	g.Parent = p:WaitForChild("PlayerGui")
+	guis[p] = g
+end
+
+local function say(text, secs)
+	for _, g in pairs(guis) do
+		g.msg.Text = text
+		g.time.Text = secs and tostring(secs) or ""
+	end
+end
+
+local function mkstat(parent, name)
+	local v = Instance.new("IntValue")
+	v.Name = name
+	v.Parent = parent
+	return v
+end
+
+local function getstat(p, name)
+	local f = p:FindFirstChild("leaderstats")
+	return f and f:FindFirstChild(name)
+end
+
+local function addstat(p, name, n)
+	local v = getstat(p, name)
+	if v then
+		v.Value += n
+	end
+end
+
+local function setup(p)
+	local f = Instance.new("Folder")
+	f.Name = "leaderstats"
+	mkstat(f, "Coins")
+	mkstat(f, "Wins")
+	mkstat(f, "Deaths")
+	f.Parent = p
+	p.CharacterAdded:Connect(function(char)
+		local h = char:WaitForChild("Humanoid")
+		h.Died:Connect(function()
+			if on then
+				addstat(p, "Deaths", 1)
+			end
+		end)
+	end)
+	task.spawn(mkgui, p)
+end
+
+local function zero()
+	for _, p in ipairs(plrs:GetPlayers()) do
+		local v = getstat(p, "Coins")
+		if v then
+			v.Value = 0
+		end
+	end
+end
+
+local function winner()
+	local best = 0
+	local top = nil
+	for _, p in ipairs(plrs:GetPlayers()) do
+		local v = getstat(p, "Coins")
+		if v and v.Value > best then
+			best = v.Value
+			top = p
+		end
+	end
+	return top
+end
+
+local function clear()
+	for c in pairs(coins) do
+		c:Destroy()
+	end
+	for _, h in ipairs(hazs) do
+		h.part:Destroy()
+	end
+	coins = {}
+	hazs = {}
+end
+
+local function grab(c, hit)
+	local p = plrs:GetPlayerFromCharacter(hit.Parent)
+	if not p or not on or not coins[c] then
+		return
+	end
+	coins[c] = nil
+	local worth = c:GetAttribute("worth")
+	c:Destroy()
+	addstat(p, "Coins", worth)
+	if getstat(p, "Coins").Value >= goal then
+		champ = p
+		on = false
+	end
+end
+
+local function spawncoin()
+	local c = ctmp:Clone()
+	c:SetAttribute("worth", 1)
+	if rng:NextNumber() < rare then
+		c:SetAttribute("worth", 3)
+		c.Color = Color3.fromRGB(80, 170, 255)
+		c.Size *= 1.5
+	end
+	c.CFrame = CFrame.new(randpos(3))
+	c.Parent = arena
+	coins[c] = true
+	c.Touched:Connect(function(hit)
+		grab(c, hit)
+	end)
+end
+
+local function topup()
+	local n = 0
+	for _ in pairs(coins) do
+		n += 1
+	end
+	for _ = n + 1, maxc do
+		spawncoin()
+	end
+end
+
+local function kill(hit)
+	local h = hit.Parent and hit.Parent:FindFirstChildOfClass("Humanoid")
+	if h and h.Health > 0 then
+		h.Health = 0
+	end
+end
+
+local function spawnhaz(i)
+	local p = htmp:Clone()
+	local s = floor.Size
+	local z = -s.Z / 2 + i * s.Z / (nhaz + 1)
+	p.Position = floor.Position + Vector3.new(0, s.Y / 2 + p.Size.Y / 2, z)
+	p.Parent = arena
+	p.Touched:Connect(kill)
+	table.insert(hazs, {
+		part = p,
+		dir = rng:NextInteger(0, 1) * 2 - 1,
+		spd = 12 + i * 3,
+	})
+end
+
+local function move(h, dt)
+	local lim = floor.Size.X / 2 - 3
+	local pos = h.part.Position + Vector3.new(h.dir * h.spd * dt, 0, 0)
+	if math.abs(pos.X - floor.Position.X) > lim then
+		h.dir = -h.dir
+	end
+	h.part.Position = pos
+end
+
+rs.Heartbeat:Connect(function(dt)
+	for c in pairs(coins) do
+		c.CFrame *= CFrame.Angles(0, dt * 3, 0)
+	end
+	for _, h in ipairs(hazs) do
+		move(h, dt)
+	end
+end)
+
+local function begin()
+	clear()
+	zero()
+	champ = nil
+	for _, p in ipairs(plrs:GetPlayers()) do
+		p:LoadCharacter()
+	end
+	for i = 1, nhaz do
+		spawnhaz(i)
+	end
+	on = true
+end
+
+local function run()
+	local t0 = os.clock()
+	while on do
+		left = rlen - (os.clock() - t0)
+		if left <= 0 then
+			break
+		end
+		say("Collect " .. goal .. " coins!", math.ceil(left))
+		topup()
+		task.wait(0.25)
+	end
+	on = false
+end
+
+local function over()
+	local w = champ or winner()
+	clear()
+	if w then
+		addstat(w, "Wins", 1)
+		say(w.Name .. " wins!", nil)
+	else
+		say("Nobody won", nil)
+	end
+	task.wait(lobby)
+end
+
+local function waitplrs()
+	while #plrs:GetPlayers() < 1 do
+		say("Waiting for players...", nil)
+		task.wait(1)
+	end
+end
+
+local function countdown()
+	for i = lobby, 1, -1 do
+		say("Round starts in", i)
+		task.wait(1)
+	end
+end
+
+plrs.PlayerAdded:Connect(setup)
+plrs.PlayerRemoving:Connect(function(p)
+	guis[p] = nil
+end)
+for _, p in ipairs(plrs:GetPlayers()) do
+	setup(p)
+end
+
+while true do
+	waitplrs()
+	countdown()
+	begin()
+	run()
+	over()
+end
