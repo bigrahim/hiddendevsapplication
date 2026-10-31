@@ -1,98 +1,85 @@
 -- Connected Discord-GitHub
--- CoinRush: a round-based arena game. Players race to collect coins while sweeping hazards fling them away.
--- Structure: CONFIG -> helpers -> Stats / Hud / Coin / Hazard classes -> round flow -> main loop.
+-- CoinRush: grab coins, dodge the sweepers
 
--- Services are fetched once and cached in locals; local lookups are faster than repeated game:GetService calls.
-local Players = game:GetService("Players")
-local ServerStorage = game:GetService("ServerStorage")
-local RunService = game:GetService("RunService")
+local players = game:GetService("Players")
+local storage = game:GetService("ServerStorage")
+local runservice = game:GetService("RunService")
 
--- All tunable numbers live in one table so balancing never requires touching logic.
-local CONFIG = {
-	GOAL = 15, -- coins needed to win early
-	MAX_COINS = 12, -- cap on coins alive at once, keeps the arena readable
-	HAZARD_COUNT = 4, -- number of sweeping hazards, one per lane
-	ROUND_LENGTH = 60, -- seconds before the round ends by time
-	INTERMISSION = 5, -- seconds of lobby/countdown between rounds
-	RARE_CHANCE = 0.15, -- probability a spawned coin is a rare one
-	RARE_VALUE = 3, -- points a rare coin is worth
-	EDGE_MARGIN = 4, -- studs kept clear of the floor edge so nothing spawns on the lip
-	KNOCKBACK = 80, -- launch speed applied to players hit by a hazard
-	TICK = 0.25, -- how often the round loop refills coins and updates the HUD
+local config = {
+	goal = 15, -- coins needed to win early
+	cap = 12, -- max coins on the floor
+	lanes = 4, -- one hazard per lane
+	duration = 60,
+	intermission = 5,
+	rarity = 0.15, -- chance a coin is rare
+	bonus = 3, -- rare coin value
+	margin = 4, -- keep spawns away from the edge
+	knockback = 80,
+	tick = 0.25,
 }
 
--- Scene references: WaitForChild yields until replication finishes, avoiding nil errors at server start.
 local arena = workspace:WaitForChild("arena")
 local floor = arena:WaitForChild("floor")
-local coinTemplate = ServerStorage:WaitForChild("coin")
-local hazardTemplate = ServerStorage:WaitForChild("hazard")
+local cointemplate = storage:WaitForChild("coin")
+local hazardtemplate = storage:WaitForChild("hazard")
 
--- One Random object is reused; creating a new one per call would waste allocations.
 local rng = Random.new()
 
--- Shared round state. A single table avoids loose upvalues and makes the data flow obvious.
 local state = {
-	active = false, -- true only while a round is being played
-	champion = nil, -- player who reached the goal first (nil if the timer decides)
-	coins = {}, -- set of live Coin objects, keyed by object for O(1) removal
-	coinCount = 0, -- tracked manually so we never have to iterate the set just to count it
-	hazards = {}, -- array of live Hazard objects
+	active = false,
+	champion = nil,
+	coins = {},
+	count = 0,
+	hazards = {},
 }
 
--- Returns a world-space point on the floor at a given height above it.
--- Using floor.CFrame:PointToWorldSpace keeps this correct even if the floor is rotated or moved.
-local function randomFloorPoint(height)
+local function randompoint(height)
 	local size = floor.Size
-	local x = rng:NextNumber(-size.X / 2 + CONFIG.EDGE_MARGIN, size.X / 2 - CONFIG.EDGE_MARGIN)
-	local z = rng:NextNumber(-size.Z / 2 + CONFIG.EDGE_MARGIN, size.Z / 2 - CONFIG.EDGE_MARGIN)
+	local x = rng:NextNumber(-size.X / 2 + config.margin, size.X / 2 - config.margin)
+	local z = rng:NextNumber(-size.Z / 2 + config.margin, size.Z / 2 - config.margin)
 	return floor.CFrame:PointToWorldSpace(Vector3.new(x, size.Y / 2 + height, z))
 end
 
--- ===================== Stats =====================
--- A plain namespace table: these functions never need per-instance state.
-local Stats = {}
+-- scores
 
--- Creates the leaderstats folder; Roblox shows any IntValue inside it on the default leaderboard.
-function Stats.create(player)
+local scores = {}
+
+function scores.create(player)
 	local folder = Instance.new("Folder")
-	folder.Name = "leaderstats" -- this exact name is what the built-in leaderboard looks for
+	folder.Name = "leaderstats"
 	for _, name in ipairs({ "Coins", "Wins", "Deaths" }) do
 		local value = Instance.new("IntValue")
 		value.Name = name
 		value.Parent = folder
 	end
-	folder.Parent = player -- parent last so the leaderboard receives a fully built folder
+	folder.Parent = player
 end
 
--- Safe accessor: returns nil instead of erroring if the player is mid-leave or not set up yet.
-function Stats.get(player, name)
+function scores.get(player, name)
 	local folder = player:FindFirstChild("leaderstats")
 	return folder and folder:FindFirstChild(name)
 end
 
--- Adds to a stat if it exists; the single guard here spares every caller from nil checks.
-function Stats.add(player, name, amount)
-	local value = Stats.get(player, name)
+function scores.add(player, name, amount)
+	local value = scores.get(player, name)
 	if value then
 		value.Value += amount
 	end
 end
 
--- Resets every player's coin count at the start of a round.
-function Stats.resetCoins()
-	for _, player in ipairs(Players:GetPlayers()) do
-		local value = Stats.get(player, "Coins")
+function scores.reset()
+	for _, player in ipairs(players:GetPlayers()) do
+		local value = scores.get(player, "Coins")
 		if value then
 			value.Value = 0
 		end
 	end
 end
 
--- Finds the player with the most coins; used as the tiebreak when time runs out.
-function Stats.leader()
+function scores.leader()
 	local best, top = 0, nil
-	for _, player in ipairs(Players:GetPlayers()) do
-		local value = Stats.get(player, "Coins")
+	for _, player in ipairs(players:GetPlayers()) do
+		local value = scores.get(player, "Coins")
 		if value and value.Value > best then
 			best, top = value.Value, player
 		end
@@ -100,21 +87,20 @@ function Stats.leader()
 	return top
 end
 
--- ===================== HUD =====================
--- Hud is a class: each player owns one instance holding their own ScreenGui labels.
-local Hud = {}
-Hud.__index = Hud -- failed lookups on an instance fall through to these methods
-local huds = {} -- player -> Hud, so the server can broadcast and clean up per player
+-- hud
 
--- Builds one styled label; shared by both labels so styling stays identical.
-local function makeLabel(parent, name, yOffset, height)
+local hud = {}
+hud.__index = hud
+local huds = {}
+
+local function newlabel(parent, name, y, height)
 	local label = Instance.new("TextLabel")
 	label.Name = name
-	label.Size = UDim2.new(1, 0, 0, height) -- full width, fixed pixel height
-	label.Position = UDim2.new(0, 0, 0, yOffset)
-	label.BackgroundTransparency = 1 -- text only, no box over the gameplay
+	label.Size = UDim2.new(1, 0, 0, height)
+	label.Position = UDim2.new(0, 0, 0, y)
+	label.BackgroundTransparency = 1
 	label.TextColor3 = Color3.new(1, 1, 1)
-	label.TextStrokeTransparency = 0 -- black outline keeps text readable on any floor colour
+	label.TextStrokeTransparency = 0
 	label.TextSize = height
 	label.Font = Enum.Font.GothamBold
 	label.Text = ""
@@ -122,89 +108,83 @@ local function makeLabel(parent, name, yOffset, height)
 	return label
 end
 
--- Constructor: creates the gui and keeps direct references so updates never search by name.
-function Hud.new(player)
-	local self = setmetatable({}, Hud)
+function hud.new(player)
+	local self = setmetatable({}, hud)
 	local gui = Instance.new("ScreenGui")
 	gui.Name = "hud"
-	gui.ResetOnSpawn = false -- the HUD must survive respawns or it would flicker every death
-	self.message = makeLabel(gui, "message", 10, 36)
-	self.timer = makeLabel(gui, "timer", 50, 28)
+	gui.ResetOnSpawn = false
+	self.message = newlabel(gui, "message", 10, 36)
+	self.timer = newlabel(gui, "timer", 50, 28)
 	gui.Parent = player:WaitForChild("PlayerGui")
 	self.gui = gui
 	huds[player] = self
 	return self
 end
 
--- Updates both labels; seconds is optional so end-of-round messages can hide the timer.
-function Hud:set(message, seconds)
+function hud:set(message, seconds)
 	self.message.Text = message
 	self.timer.Text = seconds and tostring(seconds) or ""
 end
 
--- Sends the same message to every connected HUD.
 local function broadcast(message, seconds)
-	for _, hud in pairs(huds) do
-		hud:set(message, seconds)
+	for _, h in pairs(huds) do
+		h:set(message, seconds)
 	end
 end
 
--- ===================== Coin =====================
-local Coin = {}
-Coin.__index = Coin
+-- coin
 
--- Builds a coin; onCollect is injected so Coin never needs to know about game rules (loose coupling).
-function Coin.new(position, isRare, onCollect)
-	local self = setmetatable({}, Coin)
-	self.value = isRare and CONFIG.RARE_VALUE or 1
-	self.base = CFrame.new(position) -- resting pose; the bobbing animation is applied on top of it
-	self.phase = rng:NextNumber(0, math.pi * 2) -- random offset so coins do not bob in lockstep
-	self.taken = false -- guards against two players touching in the same frame
-	self.part = coinTemplate:Clone()
-	self.part.Anchored = true -- we drive the CFrame manually, so physics must not interfere
-	if isRare then
+local coin = {}
+coin.__index = coin
+
+function coin.new(position, rare, oncollect)
+	local self = setmetatable({}, coin)
+	self.value = rare and config.bonus or 1
+	self.base = CFrame.new(position)
+	self.phase = rng:NextNumber(0, math.pi * 2) -- so coins don't bob in sync
+	self.taken = false
+	self.part = cointemplate:Clone()
+	self.part.Anchored = true
+	if rare then
 		self.part.Color = Color3.fromRGB(80, 170, 255)
 		self.part.Size *= 1.5
 	end
 	self.part.CFrame = self.base
 	self.part.Parent = arena
 	self.connection = self.part.Touched:Connect(function(hit)
-		local player = Players:GetPlayerFromCharacter(hit.Parent) -- ignores non-character parts
+		local player = players:GetPlayerFromCharacter(hit.Parent)
 		if player and not self.taken then
 			self.taken = true
-			onCollect(self, player)
+			oncollect(self, player)
 		end
 	end)
 	return self
 end
 
--- Per-frame animation: sine bob on Y combined with a spin, composed with CFrame multiplication.
-function Coin:update(t)
+function coin:update(t)
 	local bob = math.sin(t * 2 + self.phase) * 0.5
 	self.part.CFrame = self.base * CFrame.new(0, bob, 0) * CFrame.Angles(0, t * 3 + self.phase, 0)
 end
 
--- Disconnect before destroying so the event handler (and its closure) can be garbage collected.
-function Coin:destroy()
+function coin:destroy()
 	self.connection:Disconnect()
 	self.part:Destroy()
 end
 
--- ===================== Hazard =====================
-local Hazard = {}
-Hazard.__index = Hazard
+-- hazard
 
--- Builds a hazard bar that sweeps across the floor along its own lane (index picks the lane).
-function Hazard.new(index)
-	local self = setmetatable({}, Hazard)
+local hazard = {}
+hazard.__index = hazard
+
+function hazard.new(index)
+	local self = setmetatable({}, hazard)
 	local size = floor.Size
-	self.part = hazardTemplate:Clone()
+	self.part = hazardtemplate:Clone()
 	self.part.Anchored = true
-	-- Lanes are evenly spaced along Z; expressing the centre in floor-local space keeps rotation correct.
-	local laneZ = -size.Z / 2 + index * size.Z / (CONFIG.HAZARD_COUNT + 1)
-	self.center = floor.CFrame * CFrame.new(0, size.Y / 2 + self.part.Size.Y / 2, laneZ)
-	self.amplitude = size.X / 2 - CONFIG.EDGE_MARGIN -- how far it travels from centre each way
-	self.frequency = 0.4 + index * 0.15 -- deeper lanes sweep faster, scaling difficulty
+	local lane = -size.Z / 2 + index * size.Z / (config.lanes + 1)
+	self.center = floor.CFrame * CFrame.new(0, size.Y / 2 + self.part.Size.Y / 2, lane)
+	self.amplitude = size.X / 2 - config.margin
+	self.frequency = 0.4 + index * 0.15 -- later lanes move faster
 	self.phase = rng:NextNumber(0, math.pi * 2)
 	self.part.CFrame = self.center
 	self.part.Parent = arena
@@ -214,167 +194,154 @@ function Hazard.new(index)
 	return self
 end
 
--- Sweeps with a sine wave (smooth ease at both ends) and spins the bar for visual danger.
-function Hazard:update(t)
+function hazard:update(t)
 	local offset = math.sin(t * self.frequency + self.phase) * self.amplitude
 	self.part.CFrame = self.center * CFrame.new(offset, 0, 0) * CFrame.Angles(0, t * 2, 0)
 end
 
--- Flings the touching character away from the hazard, then kills it for a ragdoll-style launch.
-function Hazard:hit(hit)
+function hazard:hit(hit)
 	local character = hit.Parent
 	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
 	local root = character and character:FindFirstChild("HumanoidRootPart")
 	if not humanoid or not root or humanoid.Health <= 0 then
-		return -- ignore scenery and already-dead characters so deaths are not double counted
+		return
 	end
-	local away = (root.Position - self.part.Position) * Vector3.new(1, 0, 1) -- flatten: push sideways only
-	local direction = away.Magnitude > 0 and away.Unit or Vector3.xAxis -- fallback if exactly overlapping
-	-- AssemblyLinearVelocity is the modern physics API; the upward component makes the launch arc.
-	root.AssemblyLinearVelocity = direction * CONFIG.KNOCKBACK + Vector3.yAxis * CONFIG.KNOCKBACK * 0.5
+	local away = (root.Position - self.part.Position) * Vector3.new(1, 0, 1)
+	local direction = away.Magnitude > 0 and away.Unit or Vector3.xAxis
+	root.AssemblyLinearVelocity = direction * config.knockback + Vector3.yAxis * config.knockback * 0.5
 	humanoid.Health = 0
 end
 
-function Hazard:destroy()
+function hazard:destroy()
 	self.connection:Disconnect()
 	self.part:Destroy()
 end
 
--- ===================== Round logic =====================
--- Called by a Coin when touched: awards points and ends the round if the goal is reached.
-local function collectCoin(coin, player)
-	if not state.active or not state.coins[coin] then
-		return -- round already over or coin already removed
+-- rounds
+
+local function collect(c, player)
+	if not state.active or not state.coins[c] then
+		return
 	end
-	state.coins[coin] = nil
-	state.coinCount -= 1
-	Stats.add(player, "Coins", coin.value)
-	coin:destroy()
-	local total = Stats.get(player, "Coins")
-	if total and total.Value >= CONFIG.GOAL then
+	state.coins[c] = nil
+	state.count -= 1
+	scores.add(player, "Coins", c.value)
+	c:destroy()
+	local total = scores.get(player, "Coins")
+	if total and total.Value >= config.goal then
 		state.champion = player
-		state.active = false -- the round loop sees this flag and exits on its next check
+		state.active = false
 	end
 end
 
--- Spawns coins until the cap is reached; the counter makes this O(missing) instead of O(all coins).
-local function topUpCoins()
-	while state.coinCount < CONFIG.MAX_COINS do
-		local isRare = rng:NextNumber() < CONFIG.RARE_CHANCE
-		local coin = Coin.new(randomFloorPoint(3), isRare, collectCoin)
-		state.coins[coin] = true
-		state.coinCount += 1
+local function refill()
+	while state.count < config.cap do
+		local rare = rng:NextNumber() < config.rarity
+		local c = coin.new(randompoint(3), rare, collect)
+		state.coins[c] = true
+		state.count += 1
 	end
 end
 
--- Destroys every coin and hazard and resets the bookkeeping.
-local function clearArena()
-	for coin in pairs(state.coins) do
-		coin:destroy()
+local function clear()
+	for c in pairs(state.coins) do
+		c:destroy()
 	end
-	for _, hazard in ipairs(state.hazards) do
-		hazard:destroy()
+	for _, h in ipairs(state.hazards) do
+		h:destroy()
 	end
-	state.coins, state.hazards, state.coinCount = {}, {}, 0
+	state.coins, state.hazards, state.count = {}, {}, 0
 end
 
--- One Heartbeat connection drives all animation; this beats giving every object its own loop.
-RunService.Heartbeat:Connect(function()
+runservice.Heartbeat:Connect(function()
 	local t = os.clock()
-	for coin in pairs(state.coins) do
-		coin:update(t)
+	for c in pairs(state.coins) do
+		c:update(t)
 	end
-	for _, hazard in ipairs(state.hazards) do
-		hazard:update(t)
+	for _, h in ipairs(state.hazards) do
+		h:update(t)
 	end
 end)
 
--- Prepares a fresh round: clean arena, zero scores, respawn everyone, spawn hazards, then open play.
-local function beginRound()
-	clearArena()
-	Stats.resetCoins()
+local function startround()
+	clear()
+	scores.reset()
 	state.champion = nil
-	for _, player in ipairs(Players:GetPlayers()) do
-		player:LoadCharacter() -- puts everybody at spawn so nobody keeps a positional advantage
+	for _, player in ipairs(players:GetPlayers()) do
+		player:LoadCharacter()
 	end
-	for index = 1, CONFIG.HAZARD_COUNT do
-		table.insert(state.hazards, Hazard.new(index))
+	for index = 1, config.lanes do
+		table.insert(state.hazards, hazard.new(index))
 	end
-	state.active = true -- flipped last so no coin can be collected mid-setup
+	state.active = true -- set last so nothing gets collected during setup
 end
 
--- Runs until the goal is hit or time expires; os.clock gives a real elapsed time regardless of task.wait drift.
-local function runRound()
-	local startTime = os.clock()
+local function playround()
+	local start = os.clock()
 	while state.active do
-		local remaining = CONFIG.ROUND_LENGTH - (os.clock() - startTime)
+		local remaining = config.duration - (os.clock() - start)
 		if remaining <= 0 then
 			break
 		end
-		broadcast("Collect " .. CONFIG.GOAL .. " coins!", math.ceil(remaining))
-		topUpCoins()
-		task.wait(CONFIG.TICK)
+		broadcast("Collect " .. config.goal .. " coins!", math.ceil(remaining))
+		refill()
+		task.wait(config.tick)
 	end
-	state.active = false -- covers the timeout path so late touches are ignored
+	state.active = false
 end
 
--- Announces the result, credits the win, clears the arena, and holds for the intermission.
-local function endRound()
-	local winner = state.champion or Stats.leader() -- goal-reacher wins; otherwise highest score
-	clearArena()
+local function endround()
+	local winner = state.champion or scores.leader()
+	clear()
 	if winner then
-		Stats.add(winner, "Wins", 1)
+		scores.add(winner, "Wins", 1)
 		broadcast(winner.Name .. " wins!")
 	else
 		broadcast("Nobody won")
 	end
-	task.wait(CONFIG.INTERMISSION)
+	task.wait(config.intermission)
 end
 
--- Blocks (without busy-waiting) until at least one player is present.
-local function waitForPlayers()
-	while #Players:GetPlayers() < 1 do
+local function waitforplayers()
+	while #players:GetPlayers() < 1 do
 		broadcast("Waiting for players...")
 		task.wait(1)
 	end
 end
 
--- Visible countdown so players know exactly when the round begins.
 local function countdown()
-	for seconds = CONFIG.INTERMISSION, 1, -1 do
+	for seconds = config.intermission, 1, -1 do
 		broadcast("Round starts in", seconds)
 		task.wait(1)
 	end
 end
 
--- Per-player setup: stats, death tracking, and HUD.
-local function setupPlayer(player)
-	Stats.create(player)
+local function setup(player)
+	scores.create(player)
 	player.CharacterAdded:Connect(function(character)
-		-- Humanoid.Died fires once per life; counting only during rounds keeps lobby deaths off the board.
 		character:WaitForChild("Humanoid").Died:Connect(function()
-			if state.active then
-				Stats.add(player, "Deaths", 1)
+			if state.active then -- don't count lobby deaths
+				scores.add(player, "Deaths", 1)
 			end
 		end)
 	end)
-	Hud.new(player) -- last, because WaitForChild("PlayerGui") may yield
+	hud.new(player)
 end
 
-Players.PlayerAdded:Connect(setupPlayer)
-Players.PlayerRemoving:Connect(function(player)
-	huds[player] = nil -- drop the reference so broadcast skips them and memory is freed
+players.PlayerAdded:Connect(setup)
+players.PlayerRemoving:Connect(function(player)
+	huds[player] = nil
 end)
--- Players who joined before this script ran would otherwise be missed; task.spawn stops yields blocking the loop.
-for _, player in ipairs(Players:GetPlayers()) do
-	task.spawn(setupPlayer, player)
+
+-- catch anyone who joined before this ran
+for _, player in ipairs(players:GetPlayers()) do
+	task.spawn(setup, player)
 end
 
--- Main loop: lobby -> countdown -> play -> results, forever.
 while true do
-	waitForPlayers()
+	waitforplayers()
 	countdown()
-	beginRound()
-	runRound()
-	endRound()
+	startround()
+	playround()
+	endround()
 end
